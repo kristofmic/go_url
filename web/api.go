@@ -5,31 +5,44 @@ import (
   "encoding/hex"
   "encoding/json"
   "crypto/md5"
+  "github.com/gorilla/mux"
+  "github.com/kristofmic/go_url/sources/redis"
 )
 
-type apiShortenURL struct {
-  URL string
+type resolveURLApiRes struct {
+  OriginalURL string `json:"original_url"`
+}
+
+type shortenURLApiReq struct {
+  URL string `json:"url"`
 }
 
 type shortenedURL struct {
-  ID uint64
-  Hash string
-  OriginalURL string
+  Hash string `json:"hash"`
+  OriginalURL string `json:"original_url"`
 }
 
-var urls = make(map[uint64]*shortenedURL)
-var ids uint64
+func resolveURLHandler(res http.ResponseWriter, req *http.Request) {
+  hash := mux.Vars(req)["hash"]
 
-func hasURL(collection *map[uint64]*shortenedURL, URL string) (has bool, ID uint64) {
-  for key, val := range *collection {
-    if val.OriginalURL == URL {
-      has = true
-      ID = key
-      break;
-    }
+  client := redis.GetClient()
+  originalURL, getErr := client.HGet(hash, "OriginalURL").Result()
+
+  if getErr != nil || originalURL == "" {
+    http.Error(res, "Short URL not found", http.StatusNotFound)
+    return
   }
 
-  return has, ID
+
+  resData, marshalJSONErr := json.Marshal(resolveURLApiRes{originalURL})
+  if marshalJSONErr != nil {
+    http.Error(res, marshalJSONErr.Error(), http.StatusInternalServerError)
+    return
+  }
+
+  res.Header().Set("Content-Type", "application/json")
+  res.WriteHeader(http.StatusOK)
+  res.Write(resData)
 }
 
 func shortenURLHandler(res http.ResponseWriter, req *http.Request) {
@@ -38,30 +51,33 @@ func shortenURLHandler(res http.ResponseWriter, req *http.Request) {
     return
   }
 
-  var reqData apiShortenURL
-  err := json.NewDecoder(req.Body).Decode(&reqData)
-  if err != nil {
-    http.Error(res, err.Error(), http.StatusInternalServerError)
+  var reqData shortenURLApiReq
+  decodeJSONErr := json.NewDecoder(req.Body).Decode(&reqData)
+  if decodeJSONErr != nil {
+    http.Error(res, decodeJSONErr.Error(), http.StatusInternalServerError)
     return
   }
 
-  ok, existingID := hasURL(&urls, reqData.URL)
-  var shortenedStruct shortenedURL
-
-  if (!ok) {
-    ids++
-    urlID := ids
-    hash := md5.Sum([]byte(reqData.URL))
-
-    shortenedStruct = shortenedURL{urlID, hex.EncodeToString(hash[:3]), reqData.URL}
-    urls[urlID] = &shortenedStruct
-  } else {
-    shortenedStruct = *urls[existingID]
+  hash := md5.Sum([]byte(reqData.URL))
+  encodedShortHash := hex.EncodeToString(hash[:3])
+  model := shortenedURL{
+    Hash: encodedShortHash,
+    OriginalURL: reqData.URL,
   }
 
-  resData, err := json.Marshal(shortenedStruct)
-  if err != nil {
-    http.Error(res, err.Error(), http.StatusInternalServerError)
+  client := redis.GetClient()
+  setErr := client.HMSet(encodedShortHash, map[string]string{
+    "Hash": model.Hash,
+    "OriginalURL": model.OriginalURL,
+  }).Err()
+  if setErr != nil {
+    http.Error(res, setErr.Error(), http.StatusInternalServerError)
+    return
+  }
+
+  resData, marshalJSONErr := json.Marshal(model)
+  if marshalJSONErr != nil {
+    http.Error(res, marshalJSONErr.Error(), http.StatusInternalServerError)
     return
   }
 
